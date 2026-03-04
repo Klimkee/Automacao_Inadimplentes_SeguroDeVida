@@ -111,6 +111,24 @@ def excel_letter_to_index(letter: str) -> int:
         result = result * 26 + (ord(ch) - ord("A") + 1)
     return result - 1
 
+def metlife_prefix_policy(value: object) -> object:
+    # normaliza primeiro (tira .0, notação científica, etc.)
+    v = normalize_policy_number(value)
+    if v is None or v is pd.NA:
+        return pd.NA
+
+    s = re.sub(r"\D", "", str(v))
+    if not s:
+        return pd.NA
+
+    # regra que você pediu
+    if len(s) == 5:
+        return "9100" + s
+    if len(s) == 6:
+        return "910" + s
+
+    return s
+
 def normalize_policy_number(value: object) -> object:
 
     if value is None or (isinstance(value, float) and pd.isna(value)):
@@ -208,7 +226,10 @@ def select_and_rename(df: pd.DataFrame, config: LayoutConfig) -> pd.DataFrame:
 
     cleaned["Seguradora"] = config.seguradora
 
-    cleaned["Número apólice"] = cleaned["Número apólice"].apply(normalize_policy_number)
+    if config.seguradora == "MetLife":
+        cleaned["Número apólice"] = cleaned["Número apólice"].apply(metlife_prefix_policy)
+    else:
+        cleaned["Número apólice"] = cleaned["Número apólice"].apply(normalize_policy_number)
     cleaned["Data vencimento"] = pd.to_datetime(
         cleaned["Data vencimento"], errors="coerce", dayfirst=True
     ).dt.date
@@ -290,19 +311,14 @@ def apply_metlife_rules(df: pd.DataFrame) -> pd.DataFrame:
         return s if s else pd.NA
 
     # ✅ APLICA A REGRA AQUI
-    d["Número apólice"] = (
-        d["Número apólice"]
-        .apply(normalize_policy_number)   # primeiro normaliza
-        .apply(_fix_apolice)              # depois aplica 910/9100
-    )
-
+    d["Número apólice"] = d["Número apólice"].apply(metlife_prefix_policy)
     # resto da sua regra continua igual...
     d["Data vencimento"] = pd.to_datetime(d["Data vencimento"], errors="coerce", dayfirst=True)
     d["Valor parcela"] = pd.to_numeric(d["Valor parcela"], errors="coerce")
 
     d = d[d["Número apólice"].notna() & d["Data vencimento"].notna()]
 
-    d["_mes"] = d["Data vencimento"].dt.to_period("M")
+    d["_mes"] = d["Data vencimento"].dt.to_period("M")  
 
     premio_por_mes = (
         d.groupby(["Número apólice", "_mes"], as_index=False)["Valor parcela"]
