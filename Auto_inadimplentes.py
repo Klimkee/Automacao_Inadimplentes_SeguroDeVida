@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 import argparse
 import re
 from dataclasses import dataclass
@@ -10,19 +10,17 @@ import pandas as pd
 from openpyxl.utils import get_column_letter
 import sys
 import os
+import time
 
 FINAL_COLUMNS = [
     "Nome segurado",
     "Data contato",
     "Número apólice",
-    "Account ID",
     "Seguradora",
     "Dias atraso",
     "Data vencimento",
     "Valor parcela",
     "Total inadimplente",
-    "Proprietário da OP",
-    "E-mail do proprietário da OP",
 ]
 
 FLOW_ORDER = [
@@ -110,6 +108,24 @@ def excel_letter_to_index(letter: str) -> int:
     for ch in letter.upper().strip():
         result = result * 26 + (ord(ch) - ord("A") + 1)
     return result - 1
+
+def metlife_prefix_policy(value: object) -> object:
+    # normaliza primeiro (tira .0, notação científica, etc.)
+    v = normalize_policy_number(value)
+    if v is None or v is pd.NA:
+        return pd.NA
+
+    s = re.sub(r"\D", "", str(v))
+    if not s:
+        return pd.NA
+
+    # regra que você pediu
+    if len(s) == 5:
+        return "9100" + s
+    if len(s) == 6:
+        return "910" + s
+
+    return s
 
 def normalize_policy_number(value: object) -> object:
 
@@ -208,7 +224,10 @@ def select_and_rename(df: pd.DataFrame, config: LayoutConfig) -> pd.DataFrame:
 
     cleaned["Seguradora"] = config.seguradora
 
-    cleaned["Número apólice"] = cleaned["Número apólice"].apply(normalize_policy_number)
+    if config.seguradora == "MetLife":
+        cleaned["Número apólice"] = cleaned["Número apólice"].apply(metlife_prefix_policy)
+    else:
+        cleaned["Número apólice"] = cleaned["Número apólice"].apply(normalize_policy_number)
     cleaned["Data vencimento"] = pd.to_datetime(
         cleaned["Data vencimento"], errors="coerce", dayfirst=True
     ).dt.date
@@ -290,19 +309,14 @@ def apply_metlife_rules(df: pd.DataFrame) -> pd.DataFrame:
         return s if s else pd.NA
 
     # ✅ APLICA A REGRA AQUI
-    d["Número apólice"] = (
-        d["Número apólice"]
-        .apply(normalize_policy_number)   # primeiro normaliza
-        .apply(_fix_apolice)              # depois aplica 910/9100
-    )
-
+    d["Número apólice"] = d["Número apólice"].apply(metlife_prefix_policy)
     # resto da sua regra continua igual...
     d["Data vencimento"] = pd.to_datetime(d["Data vencimento"], errors="coerce", dayfirst=True)
     d["Valor parcela"] = pd.to_numeric(d["Valor parcela"], errors="coerce")
 
     d = d[d["Número apólice"].notna() & d["Data vencimento"].notna()]
 
-    d["_mes"] = d["Data vencimento"].dt.to_period("M")
+    d["_mes"] = d["Data vencimento"].dt.to_period("M")  
 
     premio_por_mes = (
         d.groupby(["Número apólice", "_mes"], as_index=False)["Valor parcela"]
@@ -372,9 +386,6 @@ def apply_azos_rules(df: pd.DataFrame) -> pd.DataFrame:
     d = d.drop(columns=["_mes", "Premio", "Total_inad"], errors="ignore")
 
     return d    
-
-
-
 def apply_omint_rules(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
@@ -418,7 +429,6 @@ def apply_omint_rules(df: pd.DataFrame) -> pd.DataFrame:
     d = d.drop(columns=["_mes", "Premio", "Total_inad"], errors="ignore")
 
     return d
-
 def apply_prudential_rules(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
@@ -463,7 +473,14 @@ def apply_prudential_rules(df: pd.DataFrame) -> pd.DataFrame:
 
     return d  
 
-def process_folder(folder: Path, output: Path, recursive: bool = True) -> None:
+
+
+
+def process_folder(
+    folder: Path,
+    output: Path,
+    recursive: bool = True,
+) -> None:
     if not folder.exists():
         raise FileNotFoundError(f"Pasta de entrada não encontrada: {folder}")
 
@@ -525,6 +542,7 @@ def process_folder(folder: Path, output: Path, recursive: bool = True) -> None:
             adjusted.append(part)
 
         final_df = pd.concat(adjusted, ignore_index=True)
+        final_df = final_df.reindex(columns=FINAL_COLUMNS)
         final_path = output / "relatorio_final.xlsx"
         save_excel_with_formats(final_df, final_path)
         print(f"\nRelatório consolidado criado: {final_path} (linhas: {len(final_df)})")
@@ -567,7 +585,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    process_folder(Path(args.input), Path(args.output), recursive=not args.no_recursive)
+    process_folder(
+        Path(args.input),
+        Path(args.output),
+        recursive=not args.no_recursive,
+    )
 
 if __name__ == "__main__":
     main()
