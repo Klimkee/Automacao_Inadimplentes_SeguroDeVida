@@ -16,11 +16,17 @@ FINAL_COLUMNS = [
     "Nome segurado",
     "Data contato",
     "Número apólice",
+    "Account ID",
     "Seguradora",
     "Dias atraso",
     "Data vencimento",
     "Valor parcela",
     "Total inadimplente",
+    "Periodicidade",
+    "Método de pagamento",
+    "Proprietário da Conta",
+    "E-mail do Proprietário da Conta",
+    "Business Channel",
 ]
 
 FLOW_ORDER = [
@@ -41,11 +47,16 @@ INSURER_ALIASES: Dict[str, Tuple[str, ...]] = {
     "prudential": ("prudential", "pru"),
 }
 
+BASE_SF_FILE_NAME = "BASE_SF_INADIMPLENCIA.xlsx"
+BASE_SF_SHEET_NAME = "Consulta1"
+
+
 @dataclass(frozen=True)
 class LayoutConfig:
     seguradora: str
     keep_letters: List[str]
     source_to_target: Dict[str, str]
+
 
 CONFIGS: Dict[str, LayoutConfig] = {
     "azos": LayoutConfig(
@@ -88,9 +99,7 @@ CONFIGS: Dict[str, LayoutConfig] = {
             "M": "Data vencimento",
         },
     ),
-    #==================
     "icatu": LayoutConfig(seguradora="Icatu", keep_letters=[], source_to_target={}),
-    #==================
     "prudential": LayoutConfig(
         seguradora="Prudential",
         keep_letters=["E", "G", "Q", "S"],
@@ -103,32 +112,15 @@ CONFIGS: Dict[str, LayoutConfig] = {
     ),
 }
 
+
 def excel_letter_to_index(letter: str) -> int:
     result = 0
     for ch in letter.upper().strip():
         result = result * 26 + (ord(ch) - ord("A") + 1)
     return result - 1
 
-def metlife_prefix_policy(value: object) -> object:
-    # normaliza primeiro (tira .0, notação científica, etc.)
-    v = normalize_policy_number(value)
-    if v is None or v is pd.NA:
-        return pd.NA
-
-    s = re.sub(r"\D", "", str(v))
-    if not s:
-        return pd.NA
-
-    # regra que você pediu
-    if len(s) == 5:
-        return "9100" + s
-    if len(s) == 6:
-        return "910" + s
-
-    return s
 
 def normalize_policy_number(value: object) -> object:
-
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return pd.NA
 
@@ -155,8 +147,24 @@ def normalize_policy_number(value: object) -> object:
     return digits if digits else pd.NA
 
 
+def metlife_prefix_policy(value: object) -> object:
+    v = normalize_policy_number(value)
+    if v is None or v is pd.NA:
+        return pd.NA
+
+    s = re.sub(r"\D", "", str(v))
+    if not s:
+        return pd.NA
+
+    if len(s) == 5:
+        return "9100" + s
+    if len(s) == 6:
+        return "910" + s
+
+    return s
+
+
 def normalize_brl_number(value: object) -> object:
-    """Converte valor monetário textual para número (float) quando possível."""
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return pd.NA
     if isinstance(value, (int, float, Decimal)):
@@ -179,6 +187,7 @@ def normalize_brl_number(value: object) -> object:
     except (InvalidOperation, ValueError):
         return pd.NA
 
+
 def save_excel_with_formats(df: pd.DataFrame, path: Path) -> None:
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         df.to_excel(writer, index=False)
@@ -197,8 +206,16 @@ def save_excel_with_formats(df: pd.DataFrame, path: Path) -> None:
             for row in range(2, ws.max_row + 1):
                 ws[f"{col_letter}{row}"].number_format = 'R$ #,##0.00'
 
+        if "Total inadimplente" in columns:
+            cidx = columns.index("Total inadimplente") + 1
+            col_letter = get_column_letter(cidx)
+            for row in range(2, ws.max_row + 1):
+                ws[f"{col_letter}{row}"].number_format = 'R$ #,##0.00'
+
+
 def read_sheet(path: Path) -> pd.DataFrame:
     return pd.read_excel(path, header=0, dtype=object)
+
 
 def select_and_rename(df: pd.DataFrame, config: LayoutConfig) -> pd.DataFrame:
     if not config.keep_letters:
@@ -218,7 +235,18 @@ def select_and_rename(df: pd.DataFrame, config: LayoutConfig) -> pd.DataFrame:
 
     cleaned = pd.DataFrame(selected)
 
-    for col in FINAL_COLUMNS:
+    base_columns = [
+        "Nome segurado",
+        "Data contato",
+        "Número apólice",
+        "Seguradora",
+        "Dias atraso",
+        "Data vencimento",
+        "Valor parcela",
+        "Total inadimplente",
+    ]
+
+    for col in base_columns:
         if col not in cleaned.columns:
             cleaned[col] = None
 
@@ -228,6 +256,7 @@ def select_and_rename(df: pd.DataFrame, config: LayoutConfig) -> pd.DataFrame:
         cleaned["Número apólice"] = cleaned["Número apólice"].apply(metlife_prefix_policy)
     else:
         cleaned["Número apólice"] = cleaned["Número apólice"].apply(normalize_policy_number)
+
     cleaned["Data vencimento"] = pd.to_datetime(
         cleaned["Data vencimento"], errors="coerce", dayfirst=True
     ).dt.date
@@ -238,7 +267,17 @@ def select_and_rename(df: pd.DataFrame, config: LayoutConfig) -> pd.DataFrame:
         lambda d: (today - d).days if pd.notnull(d) and d < today else 0
     )
 
-    return cleaned[FINAL_COLUMNS]
+    return cleaned[[
+        "Nome segurado",
+        "Data contato",
+        "Número apólice",
+        "Seguradora",
+        "Dias atraso",
+        "Data vencimento",
+        "Valor parcela",
+        "Total inadimplente",
+    ]]
+
 
 def detect_insurer(file_name: str) -> Optional[str]:
     normalized = file_name.lower().replace("_", " ").replace("-", " ")
@@ -249,231 +288,155 @@ def detect_insurer(file_name: str) -> Optional[str]:
                 return key
     return None
 
-#Aqui em baixo está o coisa ruim de fazer manutenção (espero que nunca de problema)
+
+def apply_generic_rules(df: pd.DataFrame, policy_normalizer) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    d = df.copy()
+    d["Número apólice"] = d["Número apólice"].apply(policy_normalizer)
+    d["Data vencimento"] = pd.to_datetime(d["Data vencimento"], errors="coerce", dayfirst=True)
+    d["Valor parcela"] = pd.to_numeric(d["Valor parcela"], errors="coerce")
+
+    d = d[d["Número apólice"].notna() & d["Data vencimento"].notna()]
+
+    d["_mes"] = d["Data vencimento"].dt.to_period("M")
+
+    premio_por_mes = (
+        d.groupby(["Número apólice", "_mes"], as_index=False)["Valor parcela"]
+        .sum()
+        .rename(columns={"Valor parcela": "Premio"})
+    )
+
+    total_por_apolice = (
+        premio_por_mes.groupby("Número apólice", as_index=False)["Premio"]
+        .sum()
+        .rename(columns={"Premio": "Total_inad"})
+    )
+
+    d = d.merge(premio_por_mes, on=["Número apólice", "_mes"], how="left")
+    d = d.merge(total_por_apolice, on="Número apólice", how="left")
+
+    d["Valor parcela"] = d["Premio"]
+    d["Total inadimplente"] = d["Total_inad"]
+
+    d = d.sort_values("Data vencimento", ascending=False).drop_duplicates(
+        subset=["Número apólice"], keep="first"
+    )
+
+    d["Data vencimento"] = d["Data vencimento"].dt.date
+    d = d.drop(columns=["_mes", "Premio", "Total_inad"], errors="ignore")
+
+    return d
+
+
 def apply_mag_rules(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-
-    d = df.copy()
+    return apply_generic_rules(df, normalize_policy_number)
 
 
-    d["Número apólice"] = d["Número apólice"].apply(normalize_policy_number)
-    d["Data vencimento"] = pd.to_datetime(d["Data vencimento"], errors="coerce", dayfirst=True)
-    d["Valor parcela"] = pd.to_numeric(d["Valor parcela"], errors="coerce")
-
-    d = d[d["Número apólice"].notna() & d["Data vencimento"].notna()]
-
-
-    d["_mes"] = d["Data vencimento"].dt.to_period("M")
-
-    premio_por_mes = (
-        d.groupby(["Número apólice", "_mes"], as_index=False)["Valor parcela"]
-        .sum()
-        .rename(columns={"Valor parcela": "Premio"})
-    )
-
-    total_por_apolice = (
-        premio_por_mes.groupby("Número apólice", as_index=False)["Premio"]
-        .sum()
-        .rename(columns={"Premio": "Total_inad"})
-    )
-
-
-    d = d.merge(premio_por_mes, on=["Número apólice", "_mes"], how="left")
-    d = d.merge(total_por_apolice, on="Número apólice", how="left")
-    d["Valor parcela"] = d["Premio"]
-    d["Total inadimplente"] = d["Total_inad"]
-
-
-    d = d.sort_values("Data vencimento", ascending=False).drop_duplicates(subset=["Número apólice"], keep="first")
-
-
-    d["Data vencimento"] = d["Data vencimento"].dt.date
-    d = d.drop(columns=["_mes", "Premio", "Total_inad"], errors="ignore")
-
-    return d
 def apply_metlife_rules(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
+    return apply_generic_rules(df, metlife_prefix_policy)
 
-    d = df.copy()
 
-    def _fix_apolice(x):
-        if pd.isna(x):
-            return pd.NA
-        s = re.sub(r"\D", "", str(x))
-        if len(s) == 5:
-            return "9100" + s
-        if len(s) == 6:
-            return "910" + s
-        return s if s else pd.NA
-
-    # ✅ APLICA A REGRA AQUI
-    d["Número apólice"] = d["Número apólice"].apply(metlife_prefix_policy)
-    # resto da sua regra continua igual...
-    d["Data vencimento"] = pd.to_datetime(d["Data vencimento"], errors="coerce", dayfirst=True)
-    d["Valor parcela"] = pd.to_numeric(d["Valor parcela"], errors="coerce")
-
-    d = d[d["Número apólice"].notna() & d["Data vencimento"].notna()]
-
-    d["_mes"] = d["Data vencimento"].dt.to_period("M")  
-
-    premio_por_mes = (
-        d.groupby(["Número apólice", "_mes"], as_index=False)["Valor parcela"]
-        .sum()
-        .rename(columns={"Valor parcela": "Premio"})
-    )
-
-    total_por_apolice = (
-        premio_por_mes.groupby("Número apólice", as_index=False)["Premio"]
-        .sum()
-        .rename(columns={"Premio": "Total_inad"})
-    )
-
-    d = d.merge(premio_por_mes, on=["Número apólice", "_mes"], how="left")
-    d = d.merge(total_por_apolice, on="Número apólice", how="left")
-
-    d["Valor parcela"] = d["Premio"]
-    d["Total inadimplente"] = d["Total_inad"]
-
-    d = d.sort_values("Data vencimento", ascending=False).drop_duplicates(subset=["Número apólice"], keep="first")
-
-    d["Data vencimento"] = d["Data vencimento"].dt.date
-    d = d.drop(columns=["_mes", "Premio", "Total_inad"], errors="ignore")
-
-    return d
 def apply_azos_rules(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-    d = df.copy()
-    d["Número apólice"] = d["Número apólice"].apply(normalize_policy_number)
-    d["Data vencimento"] = pd.to_datetime(d["Data vencimento"], errors="coerce", dayfirst=True)
-    d["Valor parcela"] = pd.to_numeric(d["Valor parcela"], errors="coerce")
-
-    d = d[d["Número apólice"].notna() & d["Data vencimento"].notna()]
+    return apply_generic_rules(df, normalize_policy_number)
 
 
-    d["_mes"] = d["Data vencimento"].dt.to_period("M")
-
-    d["_mes"] = d["Data vencimento"].dt.to_period("M")
-    
-
-    premio_por_mes = (
-        d.groupby(["Número apólice", "_mes"], as_index=False)["Valor parcela"]
-        .sum()
-        .rename(columns={"Valor parcela": "Premio"})
-    )
-
-    total_por_apolice = (
-        premio_por_mes.groupby("Número apólice", as_index=False)["Premio"]
-        .sum()
-        .rename(columns={"Premio": "Total_inad"})
-    )
-
-
-    d = d.merge(premio_por_mes, on=["Número apólice", "_mes"], how="left")
-    d = d.merge(total_por_apolice, on="Número apólice", how="left")
-
-
-    d["Valor parcela"] = d["Premio"]
-    d["Total inadimplente"] = d["Total_inad"]
-
-
-    d = d.sort_values("Data vencimento", ascending=False).drop_duplicates(subset=["Número apólice"], keep="first")
-
-
-    d["Data vencimento"] = d["Data vencimento"].dt.date
-    d = d.drop(columns=["_mes", "Premio", "Total_inad"], errors="ignore")
-
-    return d    
 def apply_omint_rules(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-    d = df.copy()
-    d["Número apólice"] = d["Número apólice"].apply(normalize_policy_number)
-    d["Data vencimento"] = pd.to_datetime(d["Data vencimento"], errors="coerce", dayfirst=True)
-    d["Valor parcela"] = pd.to_numeric(d["Valor parcela"], errors="coerce")
-
-    d = d[d["Número apólice"].notna() & d["Data vencimento"].notna()]
+    return apply_generic_rules(df, normalize_policy_number)
 
 
-    d["_mes"] = d["Data vencimento"].dt.to_period("M")
-
-
-    premio_por_mes = (
-        d.groupby(["Número apólice", "_mes"], as_index=False)["Valor parcela"]
-        .sum()
-        .rename(columns={"Valor parcela": "Premio"})
-    )
-
-
-    total_por_apolice = (
-        premio_por_mes.groupby("Número apólice", as_index=False)["Premio"]
-        .sum()
-        .rename(columns={"Premio": "Total_inad"})
-    )
-
-
-    d = d.merge(premio_por_mes, on=["Número apólice", "_mes"], how="left")
-    d = d.merge(total_por_apolice, on="Número apólice", how="left")
-
-
-    d["Valor parcela"] = d["Premio"]
-    d["Total inadimplente"] = d["Total_inad"]
-
-
-    d = d.sort_values("Data vencimento", ascending=False).drop_duplicates(subset=["Número apólice"], keep="first")
-
-
-    d["Data vencimento"] = d["Data vencimento"].dt.date
-    d = d.drop(columns=["_mes", "Premio", "Total_inad"], errors="ignore")
-
-    return d
 def apply_prudential_rules(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-    d = df.copy()
-    d["Número apólice"] = d["Número apólice"].apply(normalize_policy_number)
-    d["Data vencimento"] = pd.to_datetime(d["Data vencimento"], errors="coerce", dayfirst=True)
-    d["Valor parcela"] = pd.to_numeric(d["Valor parcela"], errors="coerce")
-
-    d = d[d["Número apólice"].notna() & d["Data vencimento"].notna()]
+    return apply_generic_rules(df, normalize_policy_number)
 
 
-    d["_mes"] = d["Data vencimento"].dt.to_period("M")
+def normalize_lookup_columns(df: pd.DataFrame) -> pd.DataFrame:
+    rename_map = {}
+
+    if "Número Apólice" in df.columns:
+        rename_map["Número Apólice"] = "Número apólice"
+
+    if "E-mail do Proprietário da conta" in df.columns:
+        rename_map["E-mail do Proprietário da conta"] = "E-mail do Proprietário da Conta"
+
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
+    return df
 
 
-    premio_por_mes = (
-        d.groupby(["Número apólice", "_mes"], as_index=False)["Valor parcela"]
-        .sum()
-        .rename(columns={"Valor parcela": "Premio"})
+def load_lookup_excel(path: Path, sheet_name: str = BASE_SF_SHEET_NAME) -> pd.DataFrame:
+    if not path.exists():
+        raise FileNotFoundError(f"Arquivo da base SF não encontrado: {path}")
+
+    df = pd.read_excel(path, sheet_name=sheet_name, dtype=object)
+    df = normalize_lookup_columns(df)
+
+    required = [
+        "Número apólice",
+        "Account ID",
+        "Periodicidade",
+        "Método de pagamento",
+        "Proprietário da Conta",
+        "E-mail do Proprietário da Conta",
+        "Business Channel",
+    ]
+
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Colunas ausentes na base SF: {missing}")
+
+    df = df[required].copy()
+    df["Número apólice"] = df["Número apólice"].apply(normalize_policy_number)
+
+    df = (
+        df.dropna(subset=["Número apólice"])
+        .drop_duplicates(subset=["Número apólice"], keep="first")
     )
 
+    return df
 
-    total_por_apolice = (
-        premio_por_mes.groupby("Número apólice", as_index=False)["Premio"]
-        .sum()
-        .rename(columns={"Premio": "Total_inad"})
+
+def enrich_with_lookup_excel(
+    df: pd.DataFrame,
+    lookup_path: Path,
+    sheet_name: str = BASE_SF_SHEET_NAME,
+) -> pd.DataFrame:
+    enriched = df.copy()
+
+    target_cols = [
+        "Account ID",
+        "Periodicidade",
+        "Método de pagamento",
+        "Proprietário da Conta",
+        "E-mail do Proprietário da Conta",
+        "Business Channel",
+    ]
+
+    for col in target_cols:
+        if col not in enriched.columns:
+            enriched[col] = pd.NA
+
+    if enriched.empty:
+        return enriched
+
+    enriched["Número apólice"] = enriched["Número apólice"].apply(normalize_policy_number)
+    lookup = load_lookup_excel(lookup_path, sheet_name=sheet_name)
+
+    enriched = enriched.merge(
+        lookup,
+        on="Número apólice",
+        how="left",
+        suffixes=("", "_sf"),
     )
 
+    for col in target_cols:
+        col_sf = f"{col}_sf"
+        if col_sf in enriched.columns:
+            enriched[col] = enriched[col].fillna(enriched[col_sf])
+            enriched = enriched.drop(columns=[col_sf])
 
-    d = d.merge(premio_por_mes, on=["Número apólice", "_mes"], how="left")
-    d = d.merge(total_por_apolice, on="Número apólice", how="left")
-
-
-    d["Valor parcela"] = d["Premio"]
-    d["Total inadimplente"] = d["Total_inad"]
-
-
-    d = d.sort_values("Data vencimento", ascending=False).drop_duplicates(subset=["Número apólice"], keep="first")
-
-
-    d["Data vencimento"] = d["Data vencimento"].dt.date
-    d = d.drop(columns=["_mes", "Premio", "Total_inad"], errors="ignore")
-
-    return d  
-
-
+    return enriched
 
 
 def process_folder(
@@ -542,6 +505,25 @@ def process_folder(
             adjusted.append(part)
 
         final_df = pd.concat(adjusted, ignore_index=True)
+
+        lookup_path = app_base_dir() / "BASE_SF_INADIMPLENCIA" / BASE_SF_FILE_NAME
+
+        try:
+            final_df = enrich_with_lookup_excel(final_df, lookup_path, sheet_name=BASE_SF_SHEET_NAME)
+            print("Enriquecimento com BASE_SF_INADIMPLENCIA concluído com sucesso.")
+        except Exception as exc:
+            print(f"AVISO - não foi possível enriquecer com a base SF: {repr(exc)}")
+            for col in [
+                "Account ID",
+                "Periodicidade",
+                "Método de pagamento",
+                "Proprietário da Conta",
+                "E-mail do Proprietário da Conta",
+                "Business Channel",
+                ]:
+                if col not in final_df.columns:
+                    final_df[col] = pd.NA
+
         final_df = final_df.reindex(columns=FINAL_COLUMNS)
         final_path = output / "relatorio_final.xlsx"
         save_excel_with_formats(final_df, final_path)
@@ -549,18 +531,28 @@ def process_folder(
     else:
         print("\nNenhuma planilha válida processada para consolidação.")
 
+    if skipped:
+        print("\nArquivos ignorados / erros:")
+        for item in skipped:
+            print(f"- {item}")
+
+
 def app_base_dir() -> Path:
-    # 1) tenta usar OneDrive corporativo (funciona pra qualquer usuário)
     od = os.environ.get("OneDriveCommercial") or os.environ.get("OneDrive")
     if od:
-        fixed = Path(od) / "Financial Planning - Automações - Documentos" / "Seguro de Vida - Documentos" / "Inadimplencia_Automacao"
+        fixed = (
+            Path(od)
+            / "Financial Planning - Automações - Documentos"
+            / "Seguro de Vida - Documentos"
+            / "Inadimplencia_Automacao"
+        )
         if fixed.exists():
             return fixed
 
-    # 2) fallback: ao lado do executável/script
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
+
 
 def parse_args() -> argparse.Namespace:
     base = app_base_dir()
@@ -583,6 +575,7 @@ def parse_args() -> argparse.Namespace:
     )
     return parser.parse_args()
 
+
 def main() -> None:
     args = parse_args()
     process_folder(
@@ -590,6 +583,7 @@ def main() -> None:
         Path(args.output),
         recursive=not args.no_recursive,
     )
+
 
 if __name__ == "__main__":
     main()
