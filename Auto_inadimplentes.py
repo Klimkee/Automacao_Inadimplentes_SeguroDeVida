@@ -24,8 +24,8 @@ FINAL_COLUMNS = [
     "Total inadimplente",
     "Periodicidade",
     "Método de pagamento",
-    "Proprietário da Conta",
-    "E-mail do Proprietário da Conta",
+    "Proprietário da Oportunidade",
+    "E-mail do Proprietário da Oportunidade",
     "Business Channel",
 ]
 
@@ -369,8 +369,8 @@ def normalize_lookup_columns(df: pd.DataFrame) -> pd.DataFrame:
     if "Número Apólice" in df.columns:
         rename_map["Número Apólice"] = "Número apólice"
 
-    if "E-mail do Proprietário da conta" in df.columns:
-        rename_map["E-mail do Proprietário da conta"] = "E-mail do Proprietário da Conta"
+    if "E-mail do Proprietário da Oportunidade" in df.columns:
+        rename_map["E-mail do Proprietário da Oportunidade"] = "E-mail do Proprietário da Oportunidade"
 
     if rename_map:
         df = df.rename(columns=rename_map)
@@ -390,8 +390,8 @@ def load_lookup_excel(path: Path, sheet_name: str = BASE_SF_SHEET_NAME) -> pd.Da
         "Account ID",
         "Periodicidade",
         "Método de pagamento",
-        "Proprietário da Conta",
-        "E-mail do Proprietário da Conta",
+        "Proprietário da Oportunidade",
+        "E-mail do Proprietário da Oportunidade",
         "Business Channel",
     ]
 
@@ -421,8 +421,8 @@ def enrich_with_lookup_excel(
         "Account ID",
         "Periodicidade",
         "Método de pagamento",
-        "Proprietário da Conta",
-        "E-mail do Proprietário da Conta",
+        "Proprietário da Oportunidade",
+        "E-mail do Proprietário da Oportunidade",
         "Business Channel",
     ]
 
@@ -530,8 +530,8 @@ def process_folder(
                 "Account ID",
                 "Periodicidade",
                 "Método de pagamento",
-                "Proprietário da Conta",
-                "E-mail do Proprietário da Conta",
+                "Proprietário da Oportunidde",
+                "E-mail do Proprietário da Oportunidade",
                 "Business Channel",
                 ]:
                 if col not in final_df.columns:
