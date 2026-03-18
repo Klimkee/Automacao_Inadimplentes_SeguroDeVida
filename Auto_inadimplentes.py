@@ -129,8 +129,14 @@ CONFIGS: Dict[str, LayoutConfig] = {
     ),
     "icatu": LayoutConfig(
         seguradora="Icatu",
-        keep_letters=[],
-        source_to_target={},
+        keep_letters=["D", "C", "E", "H", "I"],
+        source_to_target={
+            "D": "Nome segurado",
+            "C": "Número apólice",
+            "E": "Data vencimento",
+            "H": "Método de pagamento",
+            "I": "Valor parcela",
+        },
     ),
     "prudential": LayoutConfig(
         seguradora="Prudential",
@@ -624,7 +630,10 @@ def select_and_rename(df: pd.DataFrame, config: LayoutConfig) -> pd.DataFrame:
     today = pd.Timestamp.now().normalize()
     cleaned["Dias atraso"] = (today - data_venc).dt.days.clip(lower=0).fillna(0).astype(int)
 
-    return cleaned[BASE_COLUMNS]
+    output_columns = BASE_COLUMNS + [
+        col for col in config.source_to_target.values() if col not in BASE_COLUMNS
+    ]
+    return cleaned[output_columns]
 
 
 def detect_insurer(file_name: str) -> Optional[str]:
@@ -680,7 +689,7 @@ def apply_generic_rules(
     d["Valor parcela"] = d["Premio"]
     d["Total inadimplente"] = d["Total_inad"]
 
-    d = d.sort_values("Data vencimento", ascending=False).drop_duplicates(
+    d = d.sort_values("Data vencimento", ascending=True).drop_duplicates(
         subset=["Número apólice"], keep="first"
     )
 
@@ -706,6 +715,10 @@ def apply_omint_rules(df: pd.DataFrame) -> pd.DataFrame:
     return apply_generic_rules(df, normalize_policy_number)
 
 
+def apply_icatu_rules(df: pd.DataFrame) -> pd.DataFrame:
+    return apply_generic_rules(df, normalize_policy_number)
+
+
 def apply_prudential_rules(df: pd.DataFrame) -> pd.DataFrame:
     return apply_generic_rules(df, normalize_policy_number)
 
@@ -715,6 +728,7 @@ RULES_BY_SEGURADORA: Dict[str, Callable[[pd.DataFrame], pd.DataFrame]] = {
     "MetLife": apply_metlife_rules,
     "Azos": apply_azos_rules,
     "Omint": apply_omint_rules,
+    "Icatu": apply_icatu_rules,
     "Prudential": apply_prudential_rules,
 }
 
@@ -765,7 +779,7 @@ def collapse_lookup_rows(df: pd.DataFrame) -> LookupLoadResult:
     return LookupLoadResult(df=collapsed, warnings=warnings)
 
 
-def load_lookup_excel(
+def load_lookup_excel(   
     path: Path,
     sheet_name: str = BASE_SF_SHEET_NAME,
 ) -> LookupLoadResult:
