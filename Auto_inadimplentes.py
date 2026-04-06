@@ -20,6 +20,8 @@ FINAL_COLUMNS = [
     "Número apólice",
     "Account ID",
     "Seguradora",
+    "STATUS PAGAMENTO",
+    "COMPETÊNCIA CONTRIBUIÇÃO",
     "Dias atraso",
     "Data vencimento",
     "Valor parcela",
@@ -36,6 +38,8 @@ BASE_COLUMNS = [
     "Data contato",
     "Número apólice",
     "Seguradora",
+    "STATUS PAGAMENTO",
+    "COMPETÊNCIA CONTRIBUIÇÃO",
     "Dias atraso",
     "Data vencimento",
     "Valor parcela",
@@ -54,6 +58,7 @@ ENRICH_COLUMNS = [
 FLOW_ORDER = [
     "azos",
     "mag",
+    "mag_comissao",
     "omint",
     "icatu",
     "metlife",
@@ -62,6 +67,7 @@ FLOW_ORDER = [
 
 INSURER_ALIASES: Dict[str, Tuple[str, ...]] = {
     "azos": ("azos",),
+    "mag_comissao": ("mag_comissao", "mag comissao", "mag comissão", "comissao_mag"),
     "mag": ("mag",),
     "omint": ("omint",),
     "icatu": ("icatu",),
@@ -230,6 +236,38 @@ def normalize_brl_number(value: object) -> object:
         return pd.NA
 
 
+def normalize_status_text(value: object) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    return str(value).strip().upper()
+
+
+def first_day_of_current_month() -> pd.Timestamp:
+    today = pd.Timestamp.now().normalize()
+    return pd.Timestamp(year=today.year, month=today.month, day=1)
+
+
+def resolve_mag_commission_status(statuses: List[str]) -> str:
+    status_set = {normalize_status_text(status) for status in statuses}
+    status_set.discard("")
+
+    inadimplente_statuses = {
+        "INADIMPLENTE",
+        "EM ALERTA",
+        "AGUARDANDO PAGAMENTO",
+    }
+    pago_statuses = {
+        "PAGO",
+        "FATURAMENTO EM ATRASO",
+    }
+
+    if inadimplente_statuses & status_set:
+        return "Inadimplente"
+    if pago_statuses & status_set:
+        return "Pago"
+    return "Sem registro"
+
+
 def distinct_non_empty_values(series: pd.Series) -> List[str]:
     values: List[str] = []
     seen = set()
@@ -282,21 +320,24 @@ def auto_fit_columns(ws, df: pd.DataFrame) -> None:
             ws.column_dimensions[get_column_letter(idx)].width = max(len(str(column)) + 2, 12)
         return
 
-    sized = df.fillna("").astype(str)
     for idx, column in enumerate(df.columns, start=1):
+        column_values = df[column].map(
+            lambda value: "" if value is None or pd.isna(value) else str(value)
+        )
         max_len = max(
-            [len(str(column)), *sized[column].map(len).tolist()],
+            [len(str(column)), *column_values.map(len).tolist()],
             default=len(str(column)),
         )
         ws.column_dimensions[get_column_letter(idx)].width = min(max(max_len + 2, 12), 32)
 
 
 def apply_number_formats(ws, columns: List[str]) -> None:
-    if "Data vencimento" in columns:
-        cidx = columns.index("Data vencimento") + 1
-        col_letter = get_column_letter(cidx)
-        for row in range(2, ws.max_row + 1):
-            ws[f"{col_letter}{row}"].number_format = "DD/MM/YYYY"
+    for date_col in ["Data vencimento", "COMPETÊNCIA CONTRIBUIÇÃO"]:
+        if date_col in columns:
+            cidx = columns.index(date_col) + 1
+            col_letter = get_column_letter(cidx)
+            for row in range(2, ws.max_row + 1):
+                ws[f"{col_letter}{row}"].number_format = "DD/MM/YYYY"
 
     for money_col in ["Valor parcela", "Total inadimplente"]:
         if money_col in columns:
@@ -323,8 +364,10 @@ def style_data_sheet(ws, df: pd.DataFrame) -> None:
 
     center_columns = {
         "Seguradora",
+        "STATUS PAGAMENTO",
         "Dias atraso",
         "Data vencimento",
+        "COMPETÊNCIA CONTRIBUIÇÃO",
         "Periodicidade",
         "Método de pagamento",
         "Business Channel",
@@ -633,16 +676,219 @@ def select_and_rename(df: pd.DataFrame, config: LayoutConfig) -> pd.DataFrame:
     output_columns = BASE_COLUMNS + [
         col for col in config.source_to_target.values() if col not in BASE_COLUMNS
     ]
+    output_columns = list(dict.fromkeys(output_columns))
     return cleaned[output_columns]
 
 
-def detect_insurer(file_name: str) -> Optional[str]:
-    normalized = file_name.lower().replace("_", " ").replace("-", " ")
-    compact = normalized.replace(" ", "")
+def load_mag_commission_sheet(path: Path) -> pd.DataFrame:
+    df = pd.read_excel(path, header=0, dtype=object)
+
+    required = [
+        "CLIENTE",
+        "PROPOSTA",
+        "COMPETÊNCIA CONTRIBUIÇÃO",
+        "STATUS CONTRIBUIÇÃO",
+        "PARCELA CONTRIBUIÇÃO",
+    ]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"Arquivo MAG comissão sem as colunas obrigatórias: {missing}"
+        )
+
+    d = df[required].copy()
+    d = d.rename(
+        columns={
+            "CLIENTE": "Nome segurado",
+            "PROPOSTA": "Número apólice",
+            "COMPETÊNCIA CONTRIBUIÇÃO": "COMPETÊNCIA CONTRIBUIÇÃO",
+            "STATUS CONTRIBUIÇÃO": "STATUS PAGAMENTO",
+            "PARCELA CONTRIBUIÇÃO": "Valor parcela",
+        }
+    )
+
+    d["Número apólice"] = d["Número apólice"].apply(normalize_policy_number)
+    d["STATUS PAGAMENTO"] = d["STATUS PAGAMENTO"].apply(normalize_status_text)
+    d["COMPETÊNCIA CONTRIBUIÇÃO"] = pd.to_datetime(
+        d["COMPETÊNCIA CONTRIBUIÇÃO"],
+        errors="coerce",
+        dayfirst=True,
+    )
+    d["Valor parcela"] = d["Valor parcela"].apply(normalize_brl_number)
+
+    d = d.dropna(subset=["Número apólice", "COMPETÊNCIA CONTRIBUIÇÃO"]).copy()
+    d["Seguradora"] = "MAG"
+
+    return d
+
+
+def summarize_mag_commission(df: pd.DataFrame) -> pd.DataFrame:
+    empty_cols = [
+        "Número apólice",
+        "Nome segurado",
+        "Seguradora",
+        "STATUS PAGAMENTO",
+        "COMPETÊNCIA CONTRIBUIÇÃO",
+        "Dias atraso",
+        "Data vencimento",
+        "Valor parcela",
+        "Total inadimplente",
+    ]
+
+    if df.empty:
+        return pd.DataFrame(columns=empty_cols)
+
+    d = df.copy()
+
+    mes_atual = first_day_of_current_month()
+    d = d[d["COMPETÊNCIA CONTRIBUIÇÃO"] <= mes_atual].copy()
+
+    if d.empty:
+        return pd.DataFrame(columns=empty_cols)
+
+    mensal = (
+        d.groupby(
+            ["Número apólice", "Nome segurado", "COMPETÊNCIA CONTRIBUIÇÃO"],
+            as_index=False
+        )
+        .agg(
+            Valor_parcela=("Valor parcela", "sum"),
+            Statuses=("STATUS PAGAMENTO", lambda s: list({normalize_status_text(x) for x in s if str(x).strip()})),
+        )
+    )
+
+    mensal["STATUS_RESOLVIDO"] = mensal["Statuses"].apply(resolve_mag_commission_status)
+
+    hoje = pd.Timestamp.now().normalize()
+    rows = []
+
+    for apolice, grp in mensal.groupby("Número apólice", sort=False):
+        grp = grp.sort_values("COMPETÊNCIA CONTRIBUIÇÃO")
+
+        nome = grp["Nome segurado"].dropna().astype(str).iloc[0] if not grp["Nome segurado"].dropna().empty else ""
+        abertas = grp[grp["STATUS_RESOLVIDO"] == "Inadimplente"].copy()
+
+        if not abertas.empty:
+            primeira_aberta = abertas["COMPETÊNCIA CONTRIBUIÇÃO"].min()
+            valor_primeira = float(
+                abertas.loc[
+                    abertas["COMPETÊNCIA CONTRIBUIÇÃO"] == primeira_aberta,
+                    "Valor_parcela"
+                ].sum()
+            )
+            total_inad = float(abertas["Valor_parcela"].sum())
+            dias_atraso = int(max((hoje - primeira_aberta).days, 0))
+
+            rows.append({
+                "Número apólice": apolice,
+                "Nome segurado": nome,
+                "Seguradora": "MAG",
+                "STATUS PAGAMENTO": "Inadimplente",
+                "COMPETÊNCIA CONTRIBUIÇÃO": primeira_aberta.date(),
+                "Data vencimento": primeira_aberta.date(),
+                "Dias atraso": dias_atraso,
+                "Valor parcela": valor_primeira,
+                "Total inadimplente": total_inad,
+            })
+        else:
+            ultima_comp = grp["COMPETÊNCIA CONTRIBUIÇÃO"].max()
+            ultima_linha = grp.loc[grp["COMPETÊNCIA CONTRIBUIÇÃO"] == ultima_comp].iloc[-1]
+            valor_ultima = float(
+                grp.loc[
+                    grp["COMPETÊNCIA CONTRIBUIÇÃO"] == ultima_comp,
+                    "Valor_parcela"
+                ].sum()
+            )
+
+            rows.append({
+                "Número apólice": apolice,
+                "Nome segurado": nome,
+                "Seguradora": "MAG",
+                "STATUS PAGAMENTO": ultima_linha["STATUS_RESOLVIDO"],
+                "COMPETÊNCIA CONTRIBUIÇÃO": ultima_comp.date() if pd.notna(ultima_comp) else pd.NaT,
+                "Data vencimento": ultima_comp.date() if pd.notna(ultima_comp) else pd.NaT,
+                "Dias atraso": 0,
+                "Valor parcela": valor_ultima,
+                "Total inadimplente": 0.0,
+            })
+
+    return pd.DataFrame(rows, columns=empty_cols)
+
+
+def apply_mag_commission_to_final(final_df: pd.DataFrame, mag_commission_df: pd.DataFrame) -> pd.DataFrame:
+    if final_df.empty or mag_commission_df.empty:
+        return final_df
+
+    result = final_df.copy()
+    commission = mag_commission_df.copy()
+
+    result["Número apólice"] = result["Número apólice"].apply(normalize_policy_number)
+    commission["Número apólice"] = commission["Número apólice"].apply(normalize_policy_number)
+
+    mag_mask = result["Seguradora"].astype(str).str.upper().eq("MAG")
+    if not mag_mask.any():
+        return result
+
+    mag_part = result.loc[mag_mask].copy()
+    others = result.loc[~mag_mask].copy()
+
+    mag_part = mag_part.merge(
+        commission[
+            [
+                "Número apólice",
+                "STATUS PAGAMENTO",
+                "COMPETÊNCIA CONTRIBUIÇÃO",
+            ]
+        ],
+        on="Número apólice",
+        how="left",
+        suffixes=("", "_com"),
+    )
+
+    status_col = "STATUS PAGAMENTO_com"
+    competencia_col = "COMPETÊNCIA CONTRIBUIÇÃO_com"
+
+    if status_col in mag_part.columns:
+        status_from_commission = mag_part[status_col].apply(normalize_status_text)
+        status_mask = status_from_commission.isin({"INADIMPLENTE", "PAGO"})
+        mag_part.loc[status_mask, "STATUS PAGAMENTO"] = mag_part.loc[status_mask, status_col]
+    else:
+        status_from_commission = pd.Series("", index=mag_part.index, dtype="object")
+        status_mask = pd.Series(False, index=mag_part.index, dtype="bool")
+
+    if competencia_col in mag_part.columns:
+        mag_part["COMPETÊNCIA CONTRIBUIÇÃO"] = mag_part[competencia_col].where(
+            status_mask & mag_part[competencia_col].notna(),
+            mag_part["COMPETÊNCIA CONTRIBUIÇÃO"],
+        )
+
+    columns_to_drop = [
+        "STATUS PAGAMENTO_com",
+        "COMPETÊNCIA CONTRIBUIÇÃO_com",
+    ]
+    mag_part = mag_part.drop(columns=columns_to_drop, errors="ignore")
+
+    result = pd.concat([mag_part, others], ignore_index=True)
+    return result
+
+
+def detect_insurer(file: Path) -> Optional[str]:
+    normalized_name = file.name.lower().replace("_", " ").replace("-", " ")
+    compact_name = normalized_name.replace(" ", "")
+    parent_name = file.parent.name.lower().strip()
+
+    if parent_name == "comissoes":
+        for alias in INSURER_ALIASES.get("mag_comissao", ()):
+            if alias.lower().replace(" ", "") in compact_name:
+                return "mag_comissao"
+        if "mag" in compact_name:
+            return "mag_comissao"
 
     for key in FLOW_ORDER:
+        if key == "mag_comissao":
+            continue
         for alias in INSURER_ALIASES.get(key, (key,)):
-            if alias.lower().replace(" ", "") in compact:
+            if alias.lower().replace(" ", "") in compact_name:
                 return key
 
     return None
@@ -695,6 +941,11 @@ def apply_generic_rules(
 
     d["Data vencimento"] = d["Data vencimento"].dt.date
     d = d.drop(columns=["_mes", "Premio", "Total_inad"], errors="ignore")
+
+    if "STATUS PAGAMENTO" not in d.columns:
+        d["STATUS PAGAMENTO"] = pd.NA
+    if "COMPETÊNCIA CONTRIBUIÇÃO" not in d.columns:
+        d["COMPETÊNCIA CONTRIBUIÇÃO"] = pd.NA
 
     return d
 
@@ -852,7 +1103,7 @@ def process_folder(
     file_iter = folder.rglob("*") if recursive else folder.iterdir()
     files = sorted(
         [p for p in file_iter if p.is_file() and p.suffix.lower() in {".xlsx", ".xlsm"}],
-        key=lambda p: p.name.lower(),
+        key=lambda p: str(p).lower(),
     )
 
     if not files:
@@ -868,19 +1119,29 @@ def process_folder(
     processed_count = 0
 
     for file in files:
-        insurer_key = detect_insurer(file.name)
+        insurer_key = detect_insurer(file)
         if not insurer_key:
             skipped.append(f"{file.name}: seguradora não identificada no nome do arquivo")
             continue
 
-        config = CONFIGS[insurer_key]
-        if not is_layout_configured(config):
-            skipped.append(
-                f"{file.name} [{config.seguradora}]: layout ainda não configurado no script"
-            )
-            continue
-
         try:
+            if insurer_key == "mag_comissao":
+                original = load_mag_commission_sheet(file)
+                cleaned = summarize_mag_commission(original)
+                per_insurer[insurer_key].append(cleaned)
+                processed_count += 1
+
+                out_path = output / f"{file.stem}_resumo.xlsx"
+                save_excel_with_formats(cleaned, out_path)
+                print(f"OK  - {file.name} [MAG Comissão] -> {out_path.name}")
+                continue
+
+            config = CONFIGS[insurer_key]
+            if not is_layout_configured(config):
+                skipped.append(
+                    f"{file.name} [{config.seguradora}]: layout ainda não configurado no script"
+                )
+                continue
             original = read_sheet(file)
             cleaned = select_and_rename(original, config)
             per_insurer[insurer_key].append(cleaned)
@@ -890,10 +1151,13 @@ def process_folder(
             save_excel_with_formats(cleaned, out_path)
             print(f"OK  - {file.name} [{config.seguradora}] -> {out_path.name}")
         except Exception as exc:
-            skipped.append(f"{file.name} [{config.seguradora}]: {repr(exc)}")
+            nome_seg = "MAG Comissão" if insurer_key == "mag_comissao" else CONFIGS[insurer_key].seguradora
+            skipped.append(f"{file.name} [{nome_seg}]: {repr(exc)}")
 
     consolidated: List[pd.DataFrame] = []
     for insurer_key in FLOW_ORDER:
+        if insurer_key == "mag_comissao":
+            continue
         consolidated.extend(per_insurer[insurer_key])
 
     if consolidated:
@@ -911,6 +1175,11 @@ def process_folder(
             adjusted.append(part)
 
         final_df = pd.concat(adjusted, ignore_index=True)
+
+        if per_insurer.get("mag_comissao"):
+            mag_commission_df = pd.concat(per_insurer["mag_comissao"], ignore_index=True)
+            final_df = apply_mag_commission_to_final(final_df, mag_commission_df)
+            print("Atualização de status da MAG via pasta 'comissoes' concluída com sucesso.")
 
         lookup_path = app_base_dir() / "BASE_SF_INADIMPLENCIA" / BASE_SF_FILE_NAME
 
